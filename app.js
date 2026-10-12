@@ -50,20 +50,21 @@ const I = {
 let _apiActivas = 0;
 function loaderOn() { _apiActivas++; const b = $('#ios-loader'); if (b) b.classList.add('active'); }
 function loaderOff() { _apiActivas = Math.max(0, _apiActivas - 1); if (_apiActivas === 0) { const b = $('#ios-loader'); if (b) b.classList.remove('active'); } }
+/* 12/10/2026 · Fase 1: el viaje lo hace red.js (pieza común del ecosistema):
+   rid en escrituras, corte al cambiar de vista, cola de fondo, reintento
+   seguro (solo red caída o eco de Google, y en escrituras solo con el mismo
+   rid) y versión del backend. Una lectura cortada no resuelve nunca: el
+   código de la vista vieja simplemente no sigue. */
 async function api(action, params = {}, opts = {}) {
   if (!opts.silencio) loaderOn();
-  try {
-    /* Todo va por POST: el PIN no tiene por qué quedar en la barra de
-       direcciones ni en los logs de acceso del Web App. */
-    const res = await fetch(`${API_URL}?action=${encodeURIComponent(action)}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'text/plain;charset=utf-8' },   // evita el preflight de CORS
-      body: JSON.stringify(params)
-    });
-    const json = await res.json();
-    if (!json.ok) throw new Error(json.error || 'Error del servidor');
-    return json.data;
-  } finally { if (!opts.silencio) loaderOff(); }
+  let json;
+  /* Todo va por POST: el PIN no tiene por qué quedar en la barra de
+     direcciones ni en los logs de acceso del Web App. */
+  try { json = await RED.pedir(API_URL, action, {}, { metodo: 'POST', cuerpo: params, fondo: !!opts.silencio && RED.esLectura(action) }); }
+  catch (e) { if (!opts.silencio) loaderOff(); if (e && e.cortado) return new Promise(() => {}); throw e; }
+  if (!opts.silencio) loaderOff();
+  if (!json.ok) throw new Error(json.error || 'Error del servidor');
+  return json.data;
 }
 
 /* ---------- Sesión (solo el PIN, en este equipo) ---------- */
@@ -149,6 +150,7 @@ function closeLayer() {
 function go(route) { location.hash = '#/' + route; }
 window.addEventListener('hashchange', render);
 function render() {
+  RED.nuevaVista();   /* 12/10/2026 · corta lecturas de la vista que se va */
   const route = (location.hash.replace(/^#\//, '') || '').split('?')[0];
   if (route === 'instalar') return viewInstalar();
   if (!ME) { const m = LOGIN_MSG; LOGIN_MSG = ''; return viewLogin(m); }
