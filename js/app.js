@@ -55,14 +55,21 @@ function loaderOff() { _apiActivas = Math.max(0, _apiActivas - 1); if (_apiActiv
    seguro (solo red caída o eco de Google, y en escrituras solo con el mismo
    rid) y versión del backend. Una lectura cortada no resuelve nunca: el
    código de la vista vieja simplemente no sigue. */
+/* 12/10/2026 · Fase 4: las LECTURAS muestran el indicador pero no levantan el
+   escudo de la capa 12 (leer nunca bloquea la navegación); las escrituras sí. */
+let _leeActivas = 0;
+function leeOn() { _leeActivas++; const b = $('#ios-loader'); if (b) b.classList.add('active'); }
+function leeOff() { _leeActivas = Math.max(0, _leeActivas - 1); if (_leeActivas === 0 && _apiActivas === 0) { const b = $('#ios-loader'); if (b) b.classList.remove('active'); } }
 async function api(action, params = {}, opts = {}) {
-  if (!opts.silencio) loaderOn();
+  const lectura = RED.esLectura(action);
+  const on = lectura ? leeOn : loaderOn, off = lectura ? leeOff : loaderOff;
+  if (!opts.silencio) on();
   let json;
   /* Todo va por POST: el PIN no tiene por qué quedar en la barra de
      direcciones ni en los logs de acceso del Web App. */
-  try { json = await RED.pedir(API_URL, action, {}, { metodo: 'POST', cuerpo: params, fondo: !!opts.silencio && RED.esLectura(action) }); }
-  catch (e) { if (!opts.silencio) loaderOff(); if (e && e.cortado) return new Promise(() => {}); throw e; }
-  if (!opts.silencio) loaderOff();
+  try { json = await RED.pedir(API_URL, action, {}, { metodo: 'POST', cuerpo: params, fondo: !!opts.silencio && lectura }); }
+  catch (e) { if (!opts.silencio) off(); if (e && e.cortado) return new Promise(() => {}); throw e; }
+  if (!opts.silencio) off();
   if (!json.ok) throw new Error(json.error || 'Error del servidor');
   return json.data;
 }
@@ -79,7 +86,7 @@ let VARS = [];
 
 function pinLeer() { try { return localStorage.getItem(PIN_KEY) || ''; } catch (e) { return ''; } }
 function pinGuardar(p) { try { localStorage.setItem(PIN_KEY, p); } catch (e) {} PIN = p; }
-function pinBorrar() { try { localStorage.removeItem(PIN_KEY); } catch (e) {} PIN = ''; ME = null; TURNO = null; TARJETAS = []; }
+function pinBorrar() { try { localStorage.removeItem(PIN_KEY); } catch (e) {} PIN = ''; ME = null; TURNO = null; TARJETAS = []; CT_MEM = null; }
 
 /* ============================================================
    PWA: INSTALACIÓN (mismo patrón de las demás apps)
@@ -165,7 +172,7 @@ function render() {
   RED.nuevaVista();   /* 12/10/2026 · corta lecturas de la vista que se va */
   const route = (location.hash.replace(/^#\//, '') || '').split('?')[0];
   if (route === 'instalar') return viewInstalar();
-  if (!ME) { const m = LOGIN_MSG; LOGIN_MSG = ''; return viewLogin(m); }
+  if (!ME && !PIN) { const m = LOGIN_MSG; LOGIN_MSG = ''; return viewLogin(m); }
   return viewTarjetas();
 }
 
@@ -246,10 +253,13 @@ function viewLogin(msg) {
     if (p.length !== 4) return toast('El PIN es de 4 dígitos', 'err');
     saving(e.currentTarget, true);
     try {
-      const r = await api('center.login', { pin: p });
+      /* 12/10/2026 · Fase 4 · LOGIN E INICIO EN UN SOLO VIAJE: center.tarjetas
+         ya revalida PIN + turno y trae el listado. Antes: center.login y
+         después center.tarjetas (dos viajes seguidos). */
+      const r = await ctPedir(p, false);
       saving(e.currentTarget, false);
       if (!r.ok) { inp.value = ''; return toast(r.msg || 'PIN incorrecto', 'err'); }
-      pinGuardar(p); ME = r.user; TURNO = r.turno; VARS = r.vars || [];
+      pinGuardar(p);
       if (location.hash === '#/tarjetas') render(); else go('tarjetas');
     } catch (err) { saving(e.currentTarget, false); toast(String(err.message || 'Error de conexión'), 'err'); }
   };
@@ -270,16 +280,38 @@ function salir(msg) {
    ============================================================ */
 function conEstado(t) { return !!(t.asistencia || t.intencion); }
 
+/* 12/10/2026 · Fase 4 · CARGA ÚNICA POR SESIÓN
+   center.tarjetas viaja compacta y comprimida (fmt=2, gz=1: con "TODOS" eran
+   771 KB). La lista queda en memoria: volver a la vista pinta de una y
+   revalida de fondo; al marcar, la tarjeta se parcha en memoria. */
+let CT_MEM = null;   // { pin, data }
+function ctAplicar(r) { ME = r.user; TURNO = r.turno; TARJETAS = r.tarjetas || []; OPC = r.opciones; OBS = r.observacion; VARS = r.vars || []; }
+async function ctPedir(pin, silencio) {
+  const r0 = await api('center.tarjetas', Object.assign({ pin: pin }, RAP.params()), { silencio: !!silencio });
+  const r = await RAP.abrir(r0);
+  if (r && r.ok) { CT_MEM = { pin: pin, data: r, t: Date.now() }; ctAplicar(r); }
+  return r || {};
+}
 async function viewTarjetas() {
-  app.innerHTML = `${appbar()}<div class="pad stack" id="ct-body"><div class="loadbox"><span class="spinner spinner-brand"></span><p class="muted small">Cargando tu listado…</p></div></div>`;
+  const mem = (CT_MEM && CT_MEM.pin === PIN) ? CT_MEM.data : null;
+  app.innerHTML = `${appbar()}<div class="pad stack" id="ct-body">${mem ? '' : '<div class="loadbox"><span class="spinner spinner-brand"></span><p class="muted small">Cargando tu listado…</p></div>'}</div>`;
   app.classList.add('wide');   // el listado sí aprovecha la pantalla del PC
   app.hidden = false; hideSplash(); bindAppbar();
+  if (mem) { ctAplicar(mem); pintarTarjetas(); }
+  if (mem && Date.now() - (CT_MEM.t || 0) < 30000) return;   // recién traído (p. ej. el login): no se repite el viaje
+  const antes = mem ? JSON.stringify([mem.tarjetas, mem.observacion, mem.turno]) : '';
   try {
-    const r = await api('center.tarjetas', { pin: PIN });
+    const r = await ctPedir(PIN, !!mem);
     if (!r.ok) return salir(r.msg || 'Vuelve a entrar');
-    ME = r.user; TURNO = r.turno; TARJETAS = r.tarjetas; OPC = r.opciones; OBS = r.observacion; VARS = r.vars || [];
-    pintarTarjetas();
-  } catch (e) { salir(String(e.message || 'Error de conexión')); }
+    const ab = $('.appbar'); if (ab) { ab.outerHTML = appbar(); bindAppbar(); }
+    if (!mem) return pintarTarjetas();
+    if (antes !== JSON.stringify([r.tarjetas, r.observacion, r.turno]) && $('#ct-body') && !layer.children.length) {
+      const q = ($('#ct-q') && $('#ct-q').value) || '', y = window.scrollY;
+      pintarTarjetas();
+      const bq = $('#ct-q'); if (bq && q) { bq.value = q; bq.dispatchEvent(new Event('input')); }
+      window.scrollTo(0, y);
+    }
+  } catch (e) { if (!mem) salir(String(e.message || 'Error de conexión')); }
 }
 
 function appbar() {
@@ -308,17 +340,33 @@ function pintarTarjetas() {
       <div class="ct-bar"><i style="width:${total ? Math.round(hechas * 100 / total) : 0}%"></i></div>
     </div>`;
 
-  const cards = total ? `<div class="ref-grid" id="ct-list">${TARJETAS.map(cardHtml).join('')}</div>`
+  /* 12/10/2026 · Fase 4 · CABECERA ANTES QUE DATOS: cabecera y las primeras
+     60 tarjetas de una; el resto entra por tandas sin congelar la pantalla.
+     Un solo manejador en la lista (antes: buscar cada tarjeta en la lista
+     completa y colgarle sus botones, y repetirlo TODO tras cada guardado). */
+  const PRIMERAS = 60, TANDA = 200;
+  const cards = total ? `<div class="ref-grid" id="ct-list">${TARJETAS.slice(0, PRIMERAS).map(cardHtml).join('')}</div>`
     : `<div class="card pad center"><p class="muted">Hoy no tienes tarjetas asignadas. Habla con el equipo.</p></div>`;
 
   $('#ct-body').innerHTML = head + cards + cierreHtml(listo, total, hechas);
   bindCards();
   bindCierre(listo);
 
-  $('#ct-q').addEventListener('input', e => {
-    const q = norm(e.target.value);
-    $$('#ct-list .rcard').forEach(c => { c.style.display = norm(c.dataset.search).includes(q) ? '' : 'none'; });
-  });
+  const filtrar = () => {
+    const q = norm(($('#ct-q') || {}).value || '');
+    $$('#ct-list .rcard').forEach(c => { c.style.display = !q || norm(c.dataset.search).includes(q) ? '' : 'none'; });
+  };
+  $('#ct-q').addEventListener('input', filtrar);
+  const lista = $('#ct-list');
+  let i = PRIMERAS;
+  const siguiente = () => {
+    if (!lista || !lista.isConnected || i >= TARJETAS.length) return;
+    lista.insertAdjacentHTML('beforeend', TARJETAS.slice(i, i + TANDA).map(cardHtml).join(''));
+    i += TANDA;
+    if (($('#ct-q') || {}).value) filtrar();
+    setTimeout(siguiente, 0);
+  };
+  if (lista && i < TARJETAS.length) requestAnimationFrame(() => setTimeout(siguiente, 0));
 }
 
 function badgeAsis(v) { if (MV.esFuera(v)) return 'warn'; const m = { 'Confirmada': 'ok', 'No puede': 'no', 'No filial': 'no', 'No contactado': 'mut' }; return m[v] || 'mut'; }
@@ -348,12 +396,15 @@ function cardHtml(t) {
 }
 
 function bindCards() {
-  $$('#ct-list .rcard').forEach(card => {
-    const t = TARJETAS.filter(x => x.documento === card.dataset.doc)[0];
-    if (!t) return;
-    card.querySelector('[data-act="accion"]').onclick = () => sheetAccion(t, card);
-    const wa = card.querySelector('[data-act="wa"]'); if (wa) wa.onclick = () => abrirWa(t);
-    const tel = card.querySelector('[data-act="tel"]'); if (tel) tel.onclick = () => window.open('tel:' + onlyDig(t.contacto), '_self');
+  const lista = $('#ct-list'); if (!lista) return;
+  const porDoc = new Map(TARJETAS.map(x => [String(x.documento), x]));
+  lista.addEventListener('click', (e) => {
+    const b = e.target.closest('[data-act]'); if (!b || !lista.contains(b)) return;
+    const card = b.closest('.rcard'); if (!card) return;
+    const t = porDoc.get(String(card.dataset.doc)); if (!t) return;
+    if (b.dataset.act === 'accion') return sheetAccion(t, card);
+    if (b.dataset.act === 'wa') return abrirWa(t);
+    if (b.dataset.act === 'tel') return window.open('tel:' + onlyDig(t.contacto), '_self');
   });
 }
 
@@ -362,8 +413,8 @@ function repintarCard(t) {
   const card = $(`#ct-list .rcard[data-doc="${t.documento}"]`);
   if (!card) return;
   const nueva = h(cardHtml(t));
+  nueva.style.display = card.style.display;   // conserva el filtro escrito
   card.replaceWith(nueva);
-  bindCards();
   const total = TARJETAS.length, hechas = TARJETAS.filter(conEstado).length;
   const p = $('.ct-prog-t'); if (p) p.innerHTML = `<b>${hechas}</b> de <b>${total}</b> con estado`;
   const b = $('.ct-bar i'); if (b) b.style.width = (total ? Math.round(hechas * 100 / total) : 0) + '%';
@@ -570,27 +621,19 @@ if ('serviceWorker' in navigator) window.addEventListener('load', () => navigato
 
 async function initApp() {
   if (typeof APP_VERSION !== 'undefined' && APP_VERSION) { APP_VERSION_LOADED = String(APP_VERSION); paintVersion(APP_VERSION_LOADED); }
-  checkVersion(); setInterval(checkVersion, 60000);
+  checkVersion(); setInterval(checkVersion, 600000);   /* 12/10 · Fase 4: también al volver a la app */
 
   const hash = location.hash || '';
   const arranqueLimpio = (hash === '' || hash === '#/' || hash.startsWith('#/tarjetas'));
   const yaContinuoWeb = sessionStorage.getItem(nsKey('continuedWeb')) === '1';
   if (!isStandalone() && !yaContinuoWeb && arranqueLimpio) { location.hash = '#/instalar'; render(); return; }
 
-  /* Sesión guardada: se revalida contra el servidor ANTES de pintar. El PIN
-     guardado no significa que hoy le toque turno. */
+  /* Sesión guardada: el PIN guardado no significa que hoy le toque turno.
+     12/10/2026 · Fase 4: se va directo al listado; center.tarjetas revalida
+     PIN + turno en el MISMO viaje (antes: center.login y luego
+     center.tarjetas). Si no le toca, salir() lo devuelve al login con el motivo. */
   PIN = pinLeer();
-  if (PIN) {
-    try {
-      const r = await api('center.login', { pin: PIN });
-      if (r.ok) {
-        ME = r.user; TURNO = r.turno; VARS = r.vars || [];
-        if (location.hash !== '#/tarjetas') { location.hash = '#/tarjetas'; return; }  // el hashchange pinta
-        return render();
-      }
-      pinBorrar(); return viewLogin(r.msg);
-    } catch (e) { pinBorrar(); return viewLogin('No se pudo conectar. Intenta de nuevo.'); }
-  }
+  if (PIN && location.hash !== '#/tarjetas') { location.hash = '#/tarjetas'; return; }  // el hashchange pinta
   render();
 }
 initApp();
